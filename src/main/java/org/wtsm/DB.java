@@ -91,6 +91,10 @@ public class DB {
         }
     }
 
+    public int getCurIndex(){
+
+    }
+
     @Data
     @ToString
     static class Record {
