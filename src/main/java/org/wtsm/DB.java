@@ -17,31 +17,36 @@ import java.util.Map;
  * 文件式数据库
  */
 public class DB {
+    // TODO: 2023/3/5 并发问题
     /**
      * index->key->record
      */
-    static Map<Integer,Map<String, Record>> MAP = new HashMap<>();
-    static Path path;
+    static Map<Integer, Map<String, Record>> MAP = new HashMap<>();
     static String BASE_PATH = "";
     // 段文件列表
     static LinkedList<Integer> INDEXES = new LinkedList<>();
     static String FILE_NAME = "database";
-    static long FILE_MAX_LENGTH = Long.MAX_VALUE;
+    static long FILE_MAX_LENGTH = 6L;
+    //    static long FILE_MAX_LENGTH = Long.MAX_VALUE;
+    static String BASE_FILE;
 
-    public static void main(String[] args) throws Exception {
+    static {
         String packageName = DB.class.getPackage().getName();
         URL resource = Thread.currentThread().getContextClassLoader().getResource("");
         BASE_PATH = resource.getPath().substring(1) + packageName.replace(".", "/");
+        BASE_FILE = BASE_PATH + "/" + FILE_NAME;
+    }
 
-//        write("name","henry");
-//        write("name","list");
-//        write("age","123");
-//        System.out.println(read("name"));
+    public static void main(String[] args) throws Exception {
+        write("name", "henry");
+        write("name", "list");
+        write("age", "123");
+        System.out.println(read("name"));
     }
 
     public static void write(String key, String value) throws Exception {
         String bytes = key + ":" + value + ";";
-        File curFile = getCurFile();
+        File curFile = getOrCreateCurFile();
         long offset = curFile.length();
         try (FileOutputStream fileOutputStream = new FileOutputStream(curFile, true)) {
             fileOutputStream.write(bytes.getBytes(StandardCharsets.UTF_8));
@@ -50,13 +55,27 @@ public class DB {
         Record record = new Record();
         record.setOffset(offset);
         record.setSize(bytes.length());
-        MAP.put(key, record);
+        putMap(key, record);
     }
 
-    private static File getCurFile() throws IOException {
-        // TODO: 2023/3/2 一开始INDEXES为空的情况
+    /**
+     * 保存键值对到内存
+     *
+     * @param key
+     * @param record
+     */
+    private static void putMap(String key, Record record) {
+        Map<String, Record> recordMap = MAP.computeIfAbsent(INDEXES.getLast(), k -> new HashMap<>());
+        recordMap.put(key, record);
+    }
+
+    private static File getOrCreateCurFile() throws IOException {
+        if (INDEXES.isEmpty()) {
+            // TODO: 2023/3/5 以后需要考虑从磁盘读取
+            INDEXES.add(1);
+        }
         // 最新的段文件
-        Path curPath = Paths.get(BASE_PATH + "/" + FILE_NAME + INDEXES.getLast());
+        Path curPath = Paths.get(BASE_FILE + INDEXES.getLast());
         if (Files.notExists(curPath)) {
             Files.createFile(curPath);
         }
@@ -64,22 +83,38 @@ public class DB {
         if (curFile.length() > FILE_MAX_LENGTH) {
             //文件过大，则使用新的段文件
             INDEXES.add(INDEXES.getLast() + 1);
-            curPath = Paths.get(BASE_PATH + "/" + FILE_NAME + INDEXES.getLast());
+            curPath = Paths.get(BASE_FILE + INDEXES.getLast());
             curFile = curPath.toFile();
             Files.createFile(curPath);
         }
         return curFile;
     }
 
+    private static File getCurFile() {
+        if (INDEXES.isEmpty()) {
+            return null;
+        }
+        // 最新的段文件
+        Path curPath = Paths.get(BASE_FILE + INDEXES.getLast());
+        return curPath.toFile();
+    }
+
     public static String read(String key) throws IOException {
-        Record record = MAP.get(key);
+        Record record = null;
+        for (Map.Entry<Integer, Map<String, Record>> entry : MAP.entrySet()) {
+            if ((record = entry.getValue().get(key)) != null) {
+                break;
+            }
+        }
         if (record == null) {
             return null;
         }
-        System.out.println(record);
-        try (FileInputStream fileInputStream = new FileInputStream(path.toFile())) {
+        File curFile = getCurFile();
+        if (curFile == null) {
+            return null;
+        }
+        try (FileInputStream fileInputStream = new FileInputStream(curFile)) {
             long offset = record.getOffset();
-            ;
             long size = record.getSize();
             byte[] b = new byte[(int) (size)];
             long readSize = 0;
@@ -89,10 +124,6 @@ public class DB {
             }
             return new String(b);
         }
-    }
-
-    public int getCurIndex(){
-
     }
 
     @Data
