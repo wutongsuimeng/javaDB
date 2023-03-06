@@ -3,6 +3,7 @@ package org.wtsm;
 import lombok.Data;
 import lombok.ToString;
 
+import java.awt.image.Kernel;
 import java.io.*;
 import java.net.URL;
 import java.nio.charset.StandardCharsets;
@@ -10,6 +11,7 @@ import java.nio.file.Files;
 import java.nio.file.Path;
 import java.nio.file.Paths;
 import java.util.*;
+import java.util.stream.Collectors;
 
 /**
  * 文件式数据库
@@ -27,6 +29,7 @@ public class DB {
     static long FILE_MAX_LENGTH = 6L;
     //    static long FILE_MAX_LENGTH = Long.MAX_VALUE;
     static String BASE_FILE;
+    static char deleteMark=' '; //删除标志
 
     static {
         String packageName = DB.class.getPackage().getName();
@@ -36,10 +39,44 @@ public class DB {
     }
 
     public static void main(String[] args) throws Exception {
+        init();
         write("name", "henry");
         write("name", "list");
         write("age", "123");
         System.out.println(read("name"));
+    }
+
+    /**
+     * 初始化索引
+     */
+    private static void init() {
+        initIndex();
+        initMap();
+    }
+
+    private static void initMap() throws IOException {
+        Path mapPath=Paths.get(BASE_PATH+"/"+"map");
+        if(Files.exists(mapPath)){
+            Map<Integer, String> map = Files.list(mapPath).collect(Collectors.toMap(f -> Integer.parseInt(f.getFileName().toString().replace("map", "")), f -> {
+                try {
+                    return Files.readString(f);
+                } catch (IOException e) {
+                    throw new RuntimeException(e);
+                }
+            }));
+            //直接放进map中
+
+        }
+    }
+
+    private static void initIndex() throws IOException {
+        Path indexPath=Paths.get(BASE_PATH+"/"+"index");
+        if(Files.exists(indexPath)){
+            String indexString = Files.readString(indexPath);
+            for (String s : indexString.split("\\|")) {
+                INDEXES.add(Integer.parseInt(s));
+            }
+        }
     }
 
     public static void write(String key, String value) throws Exception {
