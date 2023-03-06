@@ -9,9 +9,7 @@ import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.nio.file.Paths;
-import java.util.HashMap;
-import java.util.LinkedList;
-import java.util.Map;
+import java.util.*;
 
 /**
  * 文件式数据库
@@ -21,7 +19,7 @@ public class DB {
     /**
      * index->key->record
      */
-    static Map<Integer, Map<String, Record>> MAP = new HashMap<>();
+    static Map<Integer, Map<String, Record>> MAP = new TreeMap<>((o1, o2) -> o2-o1);
     static String BASE_PATH = "";
     // 段文件列表
     static LinkedList<Integer> INDEXES = new LinkedList<>();
@@ -90,29 +88,25 @@ public class DB {
         return curFile;
     }
 
-    private static File getCurFile() {
-        if (INDEXES.isEmpty()) {
-            return null;
-        }
+    private static File getFile(int index) {
         // 最新的段文件
-        Path curPath = Paths.get(BASE_FILE + INDEXES.getLast());
+        Path curPath = Paths.get(BASE_FILE + index);
         return curPath.toFile();
     }
 
     public static String read(String key) throws IOException {
         Record record = null;
+        int index=0;
         for (Map.Entry<Integer, Map<String, Record>> entry : MAP.entrySet()) {
             if ((record = entry.getValue().get(key)) != null) {
+                index=entry.getKey();
                 break;
             }
         }
         if (record == null) {
             return null;
         }
-        File curFile = getCurFile();
-        if (curFile == null) {
-            return null;
-        }
+        File curFile = getFile(index);
         try (FileInputStream fileInputStream = new FileInputStream(curFile)) {
             long offset = record.getOffset();
             long size = record.getSize();
