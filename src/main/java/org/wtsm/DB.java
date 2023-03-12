@@ -17,6 +17,7 @@ import java.util.*;
 import java.util.concurrent.ArrayBlockingQueue;
 import java.util.concurrent.ThreadPoolExecutor;
 import java.util.concurrent.TimeUnit;
+import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.stream.Collectors;
 import java.util.stream.Stream;
 
@@ -59,7 +60,7 @@ public class DB {
      * 磁盘缓存文件名
      */
     static String CACHE_FILE_NAME = "cache";
-    static ThreadPoolExecutor threadPoolExecutor = new ThreadPoolExecutor(Runtime.getRuntime().availableProcessors() * 2, Integer.MAX_VALUE, 60, TimeUnit.SECONDS, new ArrayBlockingQueue<>(1024 * 6));
+    static ThreadPoolExecutor threadPoolExecutor = new ThreadPoolExecutor(1, 1, 60, TimeUnit.SECONDS, new ArrayBlockingQueue<>(1024 * 6));
 
     public static void main(String[] args) throws Exception {
         init();
@@ -107,9 +108,9 @@ public class DB {
         if (Files.exists(cacheDir)) {
             try (Stream<Path> list = Files.list(cacheDir)) {
                 for (Path path : list.collect(Collectors.toList())) {
-                    int key = Integer.parseInt(path.getFileName().toString().replace(CACHE_FILE_NAME, ""));
+                    int index = Integer.parseInt(path.getFileName().toString().replace(CACHE_FILE_NAME, ""));
                     String value = Files.readString(path);
-                    CACHE_MAP.put(key, JSON.parseObject(value, new TypeReference<>() {
+                    CACHE_MAP.put(index, JSON.parseObject(value, new TypeReference<>() {
                     }));
                 }
             }
@@ -139,9 +140,10 @@ public class DB {
             Files.createFile(curPath);
 
             //合并与压缩
-            threadPoolExecutor.execute(() -> {
-                task();
-            });
+//            threadPoolExecutor.execute(() -> {
+//                task();
+//            });
+            task();
         }
         File curFile = curPath.toFile();
         long offset = curFile.length();
@@ -162,7 +164,7 @@ public class DB {
                 createFile(cachePath);
             }
             try {
-                Files.write(cachePath, JSON.toJSONBytes(record));
+                Files.write(cachePath, JSON.toJSONBytes(CACHE_MAP.get(finalCurIndex)), StandardOpenOption.WRITE);
             } catch (IOException e) {
                 throw new RuntimeException(e);
             }
@@ -172,7 +174,7 @@ public class DB {
     /**
      * 创建文件，并同时创建上级目录
      */
-    public static void createFile(Path path) {
+    public synchronized static void createFile(Path path) {
         if (Files.exists(path)) {
             return;
         }
@@ -195,15 +197,23 @@ public class DB {
         recordMap.put(key, record);
     }
 
+    // TODO: 2023/3/12 单线程实现
     private static void task() {
         try {
             //合并后文件
             int mergeIndex = 0;
             Path mergePath = Paths.get(BASE_PATH + "/merge/" + mergeIndex);
-            FileChannel mergeChannel = FileChannel.open(mergePath, StandardOpenOption.CREATE, StandardOpenOption.WRITE);
+            createFile(mergePath);
+            FileChannel mergeChannel = FileChannel.open(mergePath, StandardOpenOption.WRITE);
+            int lastIndex = INDEXES.get(INDEXES.size() - 1); //记录下合并的位置
+            Map<Integer, Map<String, Record>> mergeCacheMap = new TreeMap<>((o1, o2) -> o2 - o1); //合并后的cache
+            long mergeOffset = 0; //合并后文件的偏移量
+            //最新的不合并
             for (int i = 0; i < INDEXES.size() - 1; i++) {
-                Map<String, Record> recordMap = CACHE_MAP.get(INDEXES.get(i));
-                Path dataPath = Paths.get(getBaseDataFileName() + INDEXES.get(i));
+                int index = INDEXES.get(i);
+                Map<String, Record> recordMap = CACHE_MAP.get(index);
+                Path dataPath = Paths.get(getBaseDataFileName() + index);
+                // TODO: 2023/3/12 如何避免重复合并操作
                 if (recordMap != null && Files.exists(dataPath)) {
                     try (FileChannel inChannel = FileChannel.open(dataPath, StandardOpenOption.READ)) {
                         for (Map.Entry<String, Record> entry : recordMap.entrySet()) {
@@ -215,11 +225,22 @@ public class DB {
                             while (transfered < size) {
                                 transfered += inChannel.transferTo(transfered + offset, size, mergeChannel);
                             }
+
+                            //保存cache
+                            Record newRecord = new Record();
+                            newRecord.setOffset(mergeOffset);
+                            newRecord.setSize(size);
+                            Map<String, Record> newRecordMap = mergeCacheMap.computeIfAbsent(mergeIndex, k -> new HashMap<>());
+                            newRecordMap.put(entry.getKey(), newRecord);
+                            //更新合并后的偏移量
+                            mergeOffset += size;
+
                             if (mergeChannel.size() > FILE_MAX_LENGTH) {
+                                mergeOffset = 0;
                                 mergeChannel.close();
                                 mergeIndex++;
                                 mergePath = Paths.get(BASE_PATH + "/merge/" + mergeIndex);
-                                mergeChannel = FileChannel.open(mergePath, StandardOpenOption.CREATE, StandardOpenOption.WRITE);
+                                mergeChannel = FileChannel.open(mergePath, StandardOpenOption.WRITE);
                             }
                         }
                     } catch (IOException e) {
@@ -230,6 +251,25 @@ public class DB {
 
             }
             mergeChannel.close();
+
+            //清除并更新
+            Iterator<Integer> iterator = INDEXES.iterator();
+            while (iterator.hasNext()) {
+                Integer index = iterator.next();
+                if (index == lastIndex) {
+                    break;
+                }
+                Files.delete(Paths.get(getBaseDataFileName() + index));
+                CACHE_MAP.remove(index);
+                iterator.remove();
+            }
+            for (int i = mergeIndex; i >= 0; i--) {
+                Path dstPath = Paths.get(getBaseDataFileName() + i);
+                createFile(dstPath);
+                Files.move(Paths.get(BASE_PATH + "/merge/" + i), dstPath);
+                CACHE_MAP.put(i, mergeCacheMap.get(i));
+                INDEXES.addFirst(i);
+            }
         } catch (Exception e) {
             throw new RuntimeException(e);
         }
