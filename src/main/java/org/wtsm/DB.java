@@ -7,16 +7,18 @@ import lombok.ToString;
 
 import java.io.*;
 import java.net.URL;
+import java.nio.channels.FileChannel;
 import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.nio.file.Paths;
+import java.nio.file.StandardOpenOption;
 import java.util.*;
 import java.util.concurrent.ArrayBlockingQueue;
-import java.util.concurrent.LinkedBlockingDeque;
 import java.util.concurrent.ThreadPoolExecutor;
 import java.util.concurrent.TimeUnit;
 import java.util.stream.Collectors;
+import java.util.stream.Stream;
 
 /**
  * 文件式数据库
@@ -26,23 +28,38 @@ public class DB {
     /**
      * index->key->record
      */
-    static Map<Integer, Map<String, Record>> MAP = new TreeMap<>((o1, o2) -> o2-o1);
+    static Map<Integer, Map<String, Record>> CACHE_MAP = new TreeMap<>((o1, o2) -> o2 - o1);
+    /**
+     * 根目录
+     */
     static String BASE_PATH = "";
+    /**
+     * 索引缓存
+     */
     // 段文件列表
     static LinkedList<Integer> INDEXES = new LinkedList<>();
-    static String FILE_NAME = "database";
+    /**
+     * 数据文件名
+     */
+    static String DATA_FILE_NAME = "db";
+    /**
+     * 数据目录名
+     */
+    static String DATA_DIR = "data";
+    /**
+     * 单个数据文明最大长度
+     */
     static long FILE_MAX_LENGTH = 6L;
     //    static long FILE_MAX_LENGTH = Long.MAX_VALUE;
-    static String BASE_FILE;
-    static char deleteMark=' '; //删除标志
-    static ThreadPoolExecutor threadPoolExecutor=new ThreadPoolExecutor(Runtime.getRuntime().availableProcessors()*2, Integer.MAX_VALUE,60, TimeUnit.SECONDS,new ArrayBlockingQueue<>(1024*6));
-
-    static {
-        String packageName = DB.class.getPackage().getName();
-        URL resource = Thread.currentThread().getContextClassLoader().getResource("");
-        BASE_PATH = resource.getPath().substring(1) + packageName.replace(".", "/");
-        BASE_FILE = BASE_PATH + "/" + FILE_NAME;
-    }
+    /**
+     * 磁盘缓存目录
+     */
+    static String CACHE_DIR = "cache";
+    /**
+     * 磁盘缓存文件名
+     */
+    static String CACHE_FILE_NAME = "cache";
+    static ThreadPoolExecutor threadPoolExecutor = new ThreadPoolExecutor(Runtime.getRuntime().availableProcessors() * 2, Integer.MAX_VALUE, 60, TimeUnit.SECONDS, new ArrayBlockingQueue<>(1024 * 6));
 
     public static void main(String[] args) throws Exception {
         init();
@@ -56,32 +73,77 @@ public class DB {
      * 初始化索引
      */
     private static void init() {
+        initPro();
         try {
-            Path mapPath=Paths.get(BASE_PATH+"/"+"map");
-            if(Files.exists(mapPath)){
-                Map<Integer, String> map = Files.list(mapPath).collect(Collectors.toMap(f -> Integer.parseInt(f.getFileName().toString().replace("map", "")), f -> {
-                    try {
-                        return Files.readString(f);
-                    } catch (IOException e) {
-                        throw new RuntimeException(e);
-                    }
-                }));
-                //直接放进map中
-                map.forEach((k,v)->{
-                    //todo 暂时使用json
-                    MAP.put(k, JSON.parseObject(v, new TypeReference<>() {}));
-                });
-
-                INDEXES.addAll(map.keySet().stream().sorted().collect(Collectors.toList()));
-            }
+            initCacheAndIndex();
         } catch (IOException e) {
             throw new RuntimeException(e);
         }
     }
 
+    private static void initPro() {
+        String packageName = DB.class.getPackage().getName();
+        URL resource = Thread.currentThread().getContextClassLoader().getResource("");
+        BASE_PATH = resource.getPath().substring(1) + packageName.replace(".", "/");
+//        BASE_FILE = BASE_PATH + "/" + DATA_FILE_NAME;
+    }
+
+    /**
+     * 获取db文件名
+     */
+    public static String getBaseDataFileName() {
+        return BASE_PATH + "/" + DATA_DIR + "/" + DATA_FILE_NAME;
+    }
+
+    /**
+     * 获取磁盘缓存文件名
+     */
+    public static String getBaseCacheFileName() {
+        return BASE_PATH + "/" + CACHE_DIR + "/" + CACHE_FILE_NAME;
+    }
+
+    private static void initCacheAndIndex() throws IOException {
+        Path cacheDir = Paths.get(BASE_PATH + "/" + CACHE_DIR);
+        if (Files.exists(cacheDir)) {
+            try (Stream<Path> list = Files.list(cacheDir)) {
+                for (Path path : list.collect(Collectors.toList())) {
+                    int key = Integer.parseInt(path.getFileName().toString().replace(CACHE_FILE_NAME, ""));
+                    String value = Files.readString(path);
+                    CACHE_MAP.put(key, JSON.parseObject(value, new TypeReference<>() {
+                    }));
+                }
+            }
+            if (!CACHE_MAP.isEmpty()) {
+                INDEXES.addAll(CACHE_MAP.keySet().stream().sorted().collect(Collectors.toList()));
+            }
+        }
+
+        if (INDEXES.isEmpty()) {
+            INDEXES.add(1);
+        }
+    }
+
     public static void write(String key, String value) throws Exception {
         String bytes = key + ":" + value + ";";
-        File curFile = getOrCreateCurFile();
+        // 最新的段文件
+        Path curPath = getCurDataPath();
+        int curIndex = INDEXES.getLast();
+        if (Files.notExists(curPath)) {
+            createFile(curPath);
+        }
+        if (curPath.toFile().length() > FILE_MAX_LENGTH) {
+            //文件过大，则使用新的段文件
+            curIndex++;
+            INDEXES.add(curIndex);
+            curPath = getCurDataPath();
+            Files.createFile(curPath);
+
+            //合并与压缩
+            threadPoolExecutor.execute(() -> {
+                task();
+            });
+        }
+        File curFile = curPath.toFile();
         long offset = curFile.length();
         try (FileOutputStream fileOutputStream = new FileOutputStream(curFile, true)) {
             fileOutputStream.write(bytes.getBytes(StandardCharsets.UTF_8));
@@ -93,109 +155,107 @@ public class DB {
         putMap(key, record);
 
         //保存到磁盘
-        Path mapPath=Paths.get(BASE_PATH+"/"+"map");
-        if(Files.notExists(mapPath)){
-            Files.createDirectory(mapPath);
+        int finalCurIndex = curIndex;
+        threadPoolExecutor.execute(() -> {
+            Path cachePath = Paths.get(getBaseCacheFileName() + finalCurIndex);
+            if (Files.notExists(cachePath)) {
+                createFile(cachePath);
+            }
+            try {
+                Files.write(cachePath, JSON.toJSONBytes(record));
+            } catch (IOException e) {
+                throw new RuntimeException(e);
+            }
+        });
+    }
+
+    /**
+     * 创建文件，并同时创建上级目录
+     */
+    public static void createFile(Path path) {
+        if (Files.exists(path)) {
+            return;
         }
-        Path mapFilePath=Paths.get(BASE_PATH+"/map/map"+INDEXES.getLast());
-        if(Files.notExists(mapFilePath)){
-            Files.createFile(mapFilePath);
+        try {
+            Path parent = path.getParent();
+            if (Files.notExists(parent)) {
+                Files.createDirectories(parent);
+            }
+            Files.createFile(path);
+        } catch (IOException e) {
+            e.printStackTrace();
         }
-        Files.write(mapFilePath, JSON.toJSONBytes(record));
     }
 
     /**
      * 保存键值对到内存
-     *
-     * @param key
-     * @param record
      */
     private static void putMap(String key, Record record) {
-        // TODO: 2023/3/7 需要考虑键值对已在map中的情况，需要删除
-        Map<String, Record> recordMap = MAP.computeIfAbsent(INDEXES.getLast(), k -> new HashMap<>());
-        Record last=recordMap.get(key);
-        if(last!=null){
-            //添加删除标志
-            
-        }
+        Map<String, Record> recordMap = CACHE_MAP.computeIfAbsent(INDEXES.getLast(), k -> new HashMap<>());
         recordMap.put(key, record);
     }
 
-    private static File getOrCreateCurFile() throws IOException {
-        if (INDEXES.isEmpty()) {
-            // TODO: 2023/3/5 以后需要考虑从磁盘读取
-            INDEXES.add(1);
-        }
-        // 最新的段文件
-        Path curPath = Paths.get(BASE_FILE + INDEXES.getLast());
-        if (Files.notExists(curPath)) {
-            Files.createFile(curPath);
-        }
-        File curFile = curPath.toFile();
-        if (curFile.length() > FILE_MAX_LENGTH) {
-            //文件过大，则使用新的段文件
-            INDEXES.add(INDEXES.getLast() + 1);
-            curPath = Paths.get(BASE_FILE + INDEXES.getLast());
-            curFile = curPath.toFile();
-            Files.createFile(curPath);
-            
-            //合并与压缩
-            threadPoolExecutor.execute(() -> {
-                //合并后文件
-                Path mergePath=Paths.get(BASE_FILE+"merge");
-                FileOutputStream mergeOut=new FileOutputStream(mergePath.toFile());
-                for (int i = 0; i < INDEXES.size()-1; i++) {
-                    Map<String, Record> recordMap = MAP.get(INDEXES.get(i));
-                    Path path=Paths.get(BASE_FILE+INDEXES.get(i));
-                    if (recordMap != null && Files.exists(path)) {
-                        try(FileInputStream in=new FileInputStream(path.toFile())){
-                            for (Map.Entry<String, Record> entry : recordMap.entrySet()) {
-                                // TODO: 2023/3/9 需要确保map的数据是顺序的
-                                Record record = entry.getValue();
-                                long offset = record.getOffset();
-                                long size = record.getSize();
-                                byte[] b = new byte[(int) (size)];
-                                long readSize = 0;
-                                in.skip(offset);
-                                while (readSize < size) {
-                                    readSize += in.read(b, (int) readSize, (int) (size - readSize));
-                                }
-
-                                // TODO: 2023/3/9 需要确定这个方法
-                                in.reset();
-                                mergeOut.write(b);
-                                // todo 有一个trans的方法能直接传输
-
+    private static void task() {
+        try {
+            //合并后文件
+            int mergeIndex = 0;
+            Path mergePath = Paths.get(BASE_PATH + "/merge/" + mergeIndex);
+            FileChannel mergeChannel = FileChannel.open(mergePath, StandardOpenOption.CREATE, StandardOpenOption.WRITE);
+            for (int i = 0; i < INDEXES.size() - 1; i++) {
+                Map<String, Record> recordMap = CACHE_MAP.get(INDEXES.get(i));
+                Path dataPath = Paths.get(getBaseDataFileName() + INDEXES.get(i));
+                if (recordMap != null && Files.exists(dataPath)) {
+                    try (FileChannel inChannel = FileChannel.open(dataPath, StandardOpenOption.READ)) {
+                        for (Map.Entry<String, Record> entry : recordMap.entrySet()) {
+                            // TODO: 2023/3/9 需要确保map的数据是顺序的
+                            Record record = entry.getValue();
+                            long offset = record.getOffset();
+                            long size = record.getSize();
+                            long transfered = 0;
+                            while (transfered < size) {
+                                transfered += inChannel.transferTo(transfered + offset, size, mergeChannel);
                             }
-                        } catch (IOException e) {
-                            throw new RuntimeException(e);
+                            if (mergeChannel.size() > FILE_MAX_LENGTH) {
+                                mergeChannel.close();
+                                mergeIndex++;
+                                mergePath = Paths.get(BASE_PATH + "/merge/" + mergeIndex);
+                                mergeChannel = FileChannel.open(mergePath, StandardOpenOption.CREATE, StandardOpenOption.WRITE);
+                            }
                         }
+                    } catch (IOException e) {
+                        mergeChannel.close();
+                        throw new RuntimeException(e);
                     }
                 }
-            });
+
+            }
+            mergeChannel.close();
+        } catch (Exception e) {
+            throw new RuntimeException(e);
         }
-        return curFile;
+
     }
 
-    private static File getFile(int index) {
-        // 最新的段文件
-        Path curPath = Paths.get(BASE_FILE + index);
-        return curPath.toFile();
+    /**
+     * 获取最新数据文件
+     */
+    public static Path getCurDataPath() {
+        return Paths.get(getBaseDataFileName() + INDEXES.getLast());
     }
 
     public static String read(String key) throws IOException {
         Record record = null;
-        int index=0;
-        for (Map.Entry<Integer, Map<String, Record>> entry : MAP.entrySet()) {
+        int index = 0;
+        for (Map.Entry<Integer, Map<String, Record>> entry : CACHE_MAP.entrySet()) {
             if ((record = entry.getValue().get(key)) != null) {
-                index=entry.getKey();
+                index = entry.getKey();
                 break;
             }
         }
         if (record == null) {
             return null;
         }
-        File curFile = getFile(index);
+        File curFile = Paths.get(getBaseDataFileName() + index).toFile();
         try (FileInputStream fileInputStream = new FileInputStream(curFile)) {
             long offset = record.getOffset();
             long size = record.getSize();
@@ -207,12 +267,5 @@ public class DB {
             }
             return new String(b);
         }
-    }
-
-    @Data
-    @ToString
-    static class Record {
-        private long offset; //偏移量
-        private long size; //大小
     }
 }
