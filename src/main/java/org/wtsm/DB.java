@@ -120,7 +120,7 @@ public class DB {
         }
 
         if (INDEXES.isEmpty()) {
-            INDEXES.add(1);
+            INDEXES.add(0);
         }
     }
 
@@ -135,7 +135,7 @@ public class DB {
         if (curPath.toFile().length() > FILE_MAX_LENGTH) {
             //文件过大，则使用新的段文件
             curIndex++;
-            INDEXES.add(curIndex);
+            INDEXES.addLast(curIndex);
             curPath = getCurDataPath();
             Files.createFile(curPath);
 
@@ -193,8 +193,7 @@ public class DB {
      * 保存键值对到内存
      */
     private static void putMap(String key, Record record) {
-        Map<String, Record> recordMap = CACHE_MAP.computeIfAbsent(INDEXES.getLast(), k -> new HashMap<>());
-        recordMap.put(key, record);
+        CACHE_MAP.computeIfAbsent(INDEXES.getLast(), k -> new HashMap<>()).put(key, record);
     }
 
     // TODO: 2023/3/12 单线程实现
@@ -240,6 +239,7 @@ public class DB {
                                 mergeChannel.close();
                                 mergeIndex++;
                                 mergePath = Paths.get(BASE_PATH + "/merge/" + mergeIndex);
+                                createFile(mergePath);
                                 mergeChannel = FileChannel.open(mergePath, StandardOpenOption.WRITE);
                             }
                         }
@@ -248,7 +248,6 @@ public class DB {
                         throw new RuntimeException(e);
                     }
                 }
-
             }
             mergeChannel.close();
 
@@ -256,18 +255,19 @@ public class DB {
             Iterator<Integer> iterator = INDEXES.iterator();
             while (iterator.hasNext()) {
                 Integer index = iterator.next();
-                if (index == lastIndex) {
-                    break;
-                }
                 Files.delete(Paths.get(getBaseDataFileName() + index));
                 CACHE_MAP.remove(index);
                 iterator.remove();
+                if (index == lastIndex) {
+                    break;
+                }
             }
             for (int i = mergeIndex; i >= 0; i--) {
                 Path dstPath = Paths.get(getBaseDataFileName() + i);
-                createFile(dstPath);
                 Files.move(Paths.get(BASE_PATH + "/merge/" + i), dstPath);
-                CACHE_MAP.put(i, mergeCacheMap.get(i));
+                if (mergeCacheMap.containsKey(i)) {
+                    CACHE_MAP.put(i, mergeCacheMap.get(i));
+                }
                 INDEXES.addFirst(i);
             }
         } catch (Exception e) {
