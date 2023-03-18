@@ -60,7 +60,7 @@ public class DB {
      * 磁盘缓存文件名
      */
     static String CACHE_FILE_NAME = "cache";
-    static ThreadPoolExecutor threadPoolExecutor = new ThreadPoolExecutor(1, 1, 60, TimeUnit.SECONDS, new ArrayBlockingQueue<>(1024 * 6));
+//    static ThreadPoolExecutor threadPoolExecutor = new ThreadPoolExecutor(1, 1, 60, TimeUnit.SECONDS, new ArrayBlockingQueue<>(1024 * 6));
 
     public static void main(String[] args) throws Exception {
         init();
@@ -132,18 +132,14 @@ public class DB {
         if (Files.notExists(curPath)) {
             createFile(curPath);
         }
+        boolean needTask = false;
         if (curPath.toFile().length() > FILE_MAX_LENGTH) {
             //文件过大，则使用新的段文件
             curIndex++;
             INDEXES.addLast(curIndex);
             curPath = getCurDataPath();
             Files.createFile(curPath);
-
-            //合并与压缩
-//            threadPoolExecutor.execute(() -> {
-//                task();
-//            });
-            task();
+            needTask = true;
         }
         File curFile = curPath.toFile();
         long offset = curFile.length();
@@ -158,17 +154,23 @@ public class DB {
 
         //保存到磁盘
         int finalCurIndex = curIndex;
-        threadPoolExecutor.execute(() -> {
-            Path cachePath = Paths.get(getBaseCacheFileName() + finalCurIndex);
-            if (Files.notExists(cachePath)) {
-                createFile(cachePath);
-            }
-            try {
-                Files.write(cachePath, JSON.toJSONBytes(CACHE_MAP.get(finalCurIndex)), StandardOpenOption.WRITE);
-            } catch (IOException e) {
-                throw new RuntimeException(e);
-            }
-        });
+//        threadPoolExecutor.execute(() -> {
+        Path cachePath = Paths.get(getBaseCacheFileName() + finalCurIndex);
+        if (Files.notExists(cachePath)) {
+            createFile(cachePath);
+        }
+        try {
+            Files.write(cachePath, JSON.toJSONBytes(CACHE_MAP.get(finalCurIndex)), StandardOpenOption.WRITE);
+        } catch (IOException e) {
+            throw new RuntimeException(e);
+        }
+//        });
+
+        //合并与压缩
+//            threadPoolExecutor.execute(() -> {
+//                task();
+//            });
+        task();
     }
 
     /**
@@ -193,6 +195,12 @@ public class DB {
      * 保存键值对到内存
      */
     private static void putMap(String key, Record record) {
+        for (Map<String, Record> map : CACHE_MAP.values()) {
+            if (map.containsKey(key)) {
+                map.remove(key);
+                break;
+            }
+        }
         CACHE_MAP.computeIfAbsent(INDEXES.getLast(), k -> new HashMap<>()).put(key, record);
     }
 
@@ -201,9 +209,8 @@ public class DB {
         try {
             //合并后文件
             int mergeIndex = 0;
-            Path mergePath = Paths.get(BASE_PATH + "/merge/" + mergeIndex);
-            createFile(mergePath);
-            FileChannel mergeChannel = FileChannel.open(mergePath, StandardOpenOption.WRITE);
+            Path mergePath = null;
+            FileChannel mergeChannel = null;
             int lastIndex = INDEXES.get(INDEXES.size() - 1); //记录下合并的位置
             Map<Integer, Map<String, Record>> mergeCacheMap = new TreeMap<>((o1, o2) -> o2 - o1); //合并后的cache
             long mergeOffset = 0; //合并后文件的偏移量
@@ -212,50 +219,67 @@ public class DB {
                 int index = INDEXES.get(i);
                 Map<String, Record> recordMap = CACHE_MAP.get(index);
                 Path dataPath = Paths.get(getBaseDataFileName() + index);
-                // TODO: 2023/3/12 如何避免重复合并操作
-                if (recordMap != null && Files.exists(dataPath)) {
-                    try (FileChannel inChannel = FileChannel.open(dataPath, StandardOpenOption.READ)) {
-                        for (Map.Entry<String, Record> entry : recordMap.entrySet()) {
-                            // TODO: 2023/3/9 需要确保map的数据是顺序的
-                            Record record = entry.getValue();
-                            long offset = record.getOffset();
-                            long size = record.getSize();
-                            long transfered = 0;
-                            while (transfered < size) {
-                                transfered += inChannel.transferTo(transfered + offset, size, mergeChannel);
-                            }
-
-                            //保存cache
-                            Record newRecord = new Record();
-                            newRecord.setOffset(mergeOffset);
-                            newRecord.setSize(size);
-                            Map<String, Record> newRecordMap = mergeCacheMap.computeIfAbsent(mergeIndex, k -> new HashMap<>());
-                            newRecordMap.put(entry.getKey(), newRecord);
-                            //更新合并后的偏移量
-                            mergeOffset += size;
-
-                            if (mergeChannel.size() > FILE_MAX_LENGTH) {
-                                mergeOffset = 0;
-                                mergeChannel.close();
-                                mergeIndex++;
-                                mergePath = Paths.get(BASE_PATH + "/merge/" + mergeIndex);
-                                createFile(mergePath);
-                                mergeChannel = FileChannel.open(mergePath, StandardOpenOption.WRITE);
-                            }
-                        }
-                    } catch (IOException e) {
-                        mergeChannel.close();
-                        throw new RuntimeException(e);
-                    }
+                if (recordMap == null || recordMap.isEmpty() || Files.notExists(dataPath)) {
+                    continue;
                 }
+                // TODO: 2023/3/12 如何避免重复合并操作
+                try (FileChannel inChannel = FileChannel.open(dataPath, StandardOpenOption.READ)) {
+                    for (Map.Entry<String, Record> entry : recordMap.entrySet()) {
+                        if (mergePath == null) {
+                            // 初始化临时文件
+                            mergePath = Paths.get(BASE_PATH + "/merge/" + mergeIndex);
+                            createFile(mergePath);
+                            mergeChannel = FileChannel.open(mergePath, StandardOpenOption.WRITE);
+                        }
+                        // TODO: 2023/3/9 需要确保map的数据是顺序的
+                        Record record = entry.getValue();
+                        long offset = record.getOffset();
+                        long size = record.getSize();
+                        long transfered = 0;
+                        while (transfered < size) {
+                            transfered += inChannel.transferTo(transfered + offset, size, mergeChannel);
+                        }
+
+                        //保存cache
+                        Record newRecord = new Record();
+                        newRecord.setOffset(mergeOffset);
+                        newRecord.setSize(size);
+                        Map<String, Record> newRecordMap = mergeCacheMap.computeIfAbsent(mergeIndex, k -> new HashMap<>());
+                        newRecordMap.put(entry.getKey(), newRecord);
+                        //更新合并后的偏移量
+                        mergeOffset += size;
+
+                        if (mergeChannel.size() > FILE_MAX_LENGTH) {
+                            mergeOffset = 0;
+                            mergeChannel.close();
+                            mergeIndex++;
+                            mergePath = Paths.get(BASE_PATH + "/merge/" + mergeIndex);
+                            createFile(mergePath);
+                            mergeChannel = FileChannel.open(mergePath, StandardOpenOption.WRITE);
+                        }
+                    }
+                } catch (IOException e) {
+                    if (mergeChannel != null) {
+                        mergeChannel.close();
+                    }
+                    throw new RuntimeException(e);
+                }
+
             }
-            mergeChannel.close();
+            if (mergeChannel != null) {
+                mergeChannel.close();
+            }
+
+            if (mergePath == null) {
+                return;
+            }
 
             //清除并更新
             Iterator<Integer> iterator = INDEXES.iterator();
             while (iterator.hasNext()) {
                 Integer index = iterator.next();
                 Files.delete(Paths.get(getBaseDataFileName() + index));
+                Files.delete(Paths.get(getBaseCacheFileName() + index));
                 CACHE_MAP.remove(index);
                 iterator.remove();
                 if (index == lastIndex) {
@@ -270,6 +294,22 @@ public class DB {
                 }
                 INDEXES.addFirst(i);
             }
+
+            mergeCacheMap.forEach((k, v) -> {
+                Path file = null;
+                try {
+                    file = Files.createFile(Paths.get(getBaseCacheFileName() + k));
+                } catch (IOException e) {
+                    throw new RuntimeException(e);
+                }
+                try {
+                    Files.write(file, JSON.toJSONBytes(v));
+                } catch (IOException e) {
+                    throw new RuntimeException(e);
+                }
+            });
+
+
         } catch (Exception e) {
             throw new RuntimeException(e);
         }
