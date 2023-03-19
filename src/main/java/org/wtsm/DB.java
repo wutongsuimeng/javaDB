@@ -2,8 +2,6 @@ package org.wtsm;
 
 import com.alibaba.fastjson.JSON;
 import com.alibaba.fastjson.TypeReference;
-import lombok.Data;
-import lombok.ToString;
 
 import java.io.*;
 import java.net.URL;
@@ -14,10 +12,6 @@ import java.nio.file.Path;
 import java.nio.file.Paths;
 import java.nio.file.StandardOpenOption;
 import java.util.*;
-import java.util.concurrent.ArrayBlockingQueue;
-import java.util.concurrent.ThreadPoolExecutor;
-import java.util.concurrent.TimeUnit;
-import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.stream.Collectors;
 import java.util.stream.Stream;
 
@@ -150,7 +144,7 @@ public class DB {
         Record record = new Record();
         record.setOffset(offset);
         record.setSize(bytes.length());
-        putMap(key, record);
+        putCacheMap(key, record);
 
         //保存到磁盘
         int finalCurIndex = curIndex;
@@ -170,7 +164,9 @@ public class DB {
 //            threadPoolExecutor.execute(() -> {
 //                task();
 //            });
-        task();
+        if (needTask) {
+            task();
+        }
     }
 
     /**
@@ -194,7 +190,7 @@ public class DB {
     /**
      * 保存键值对到内存
      */
-    private static void putMap(String key, Record record) {
+    private static void putCacheMap(String key, Record record) {
         for (Map<String, Record> map : CACHE_MAP.values()) {
             if (map.containsKey(key)) {
                 map.remove(key);
@@ -211,7 +207,7 @@ public class DB {
             int mergeIndex = 0;
             Path mergePath = null;
             FileChannel mergeChannel = null;
-            int lastIndex = INDEXES.get(INDEXES.size() - 1); //记录下合并的位置
+            int lastIndex = INDEXES.get(INDEXES.size() - 2); //记录下合并的位置
             Map<Integer, Map<String, Record>> mergeCacheMap = new TreeMap<>((o1, o2) -> o2 - o1); //合并后的cache
             long mergeOffset = 0; //合并后文件的偏移量
             //最新的不合并
