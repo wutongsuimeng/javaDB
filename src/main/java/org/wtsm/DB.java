@@ -12,6 +12,7 @@ import java.nio.file.Path;
 import java.nio.file.Paths;
 import java.nio.file.StandardOpenOption;
 import java.util.*;
+import java.util.concurrent.ConcurrentSkipListMap;
 import java.util.stream.Collectors;
 import java.util.stream.Stream;
 
@@ -19,11 +20,10 @@ import java.util.stream.Stream;
  * 文件式数据库
  */
 public class DB {
-    // TODO: 2023/3/5 并发问题
     /**
      * index->key->record
      */
-    static Map<Integer, Map<String, Record>> CACHE_MAP = new TreeMap<>((o1, o2) -> o2 - o1);
+    static Map<Integer, Map<String, Record>> CACHE_MAP = new ConcurrentSkipListMap<>((o1, o2) -> o2 - o1);
     /**
      * 根目录
      */
@@ -67,7 +67,7 @@ public class DB {
     /**
      * 初始化索引
      */
-    private static void init() {
+    public static void init() {
         initPro();
         try {
             initCacheAndIndex();
@@ -77,10 +77,10 @@ public class DB {
     }
 
     private static void initPro() {
-        String packageName = DB.class.getPackage().getName();
-        URL resource = Thread.currentThread().getContextClassLoader().getResource("");
-        BASE_PATH = resource.getPath().substring(1) + packageName.replace(".", "/");
-//        BASE_FILE = BASE_PATH + "/" + DATA_FILE_NAME;
+        ResourceBundle rb2 = ResourceBundle.getBundle("db");
+        String dbDir = rb2.getString("db_dir");
+        BASE_PATH = dbDir + "//";
+        System.out.println(BASE_PATH);
     }
 
     /**
@@ -227,7 +227,6 @@ public class DB {
                             createFile(mergePath);
                             mergeChannel = FileChannel.open(mergePath, StandardOpenOption.WRITE);
                         }
-                        // TODO: 2023/3/9 需要确保map的数据是顺序的
                         Record record = entry.getValue();
                         long offset = record.getOffset();
                         long size = record.getSize();
@@ -274,8 +273,14 @@ public class DB {
             Iterator<Integer> iterator = INDEXES.iterator();
             while (iterator.hasNext()) {
                 Integer index = iterator.next();
-                Files.delete(Paths.get(getBaseDataFileName() + index));
-                Files.delete(Paths.get(getBaseCacheFileName() + index));
+                Path dataPath = Paths.get(getBaseDataFileName() + index);
+                if (Files.exists(dataPath)) {
+                    Files.delete(dataPath);
+                }
+                Path cachePath = Paths.get(getBaseCacheFileName() + index);
+                if (Files.exists(cachePath)) {
+                    Files.delete(cachePath);
+                }
                 CACHE_MAP.remove(index);
                 iterator.remove();
                 if (index == lastIndex) {
