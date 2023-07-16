@@ -4,7 +4,6 @@ import com.alibaba.fastjson.JSON;
 import com.alibaba.fastjson.TypeReference;
 
 import java.io.*;
-import java.net.URL;
 import java.nio.channels.FileChannel;
 import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
@@ -25,39 +24,21 @@ public class DB {
      */
     static Map<Integer, Map<String, Record>> CACHE_MAP = new ConcurrentSkipListMap<>((o1, o2) -> o2 - o1);
     /**
-     * 根目录
-     */
-    static String BASE_PATH = "";
-    /**
      * 索引缓存
      */
     // 段文件列表
-    static LinkedList<Integer> INDEXES = new LinkedList<>();
-    /**
-     * 数据文件名
-     */
-    static String DATA_FILE_NAME = "db";
-    /**
-     * 数据目录名
-     */
-    static String DATA_DIR = "data";
-    /**
-     * 单个数据文明最大长度
-     */
-    static long FILE_MAX_LENGTH = 6L;
-    //    static long FILE_MAX_LENGTH = Long.MAX_VALUE;
-    /**
-     * 磁盘缓存目录
-     */
-    static String CACHE_DIR = "cache";
-    /**
-     * 磁盘缓存文件名
-     */
-    static String CACHE_FILE_NAME = "cache";
-//    static ThreadPoolExecutor threadPoolExecutor = new ThreadPoolExecutor(1, 1, 60, TimeUnit.SECONDS, new ArrayBlockingQueue<>(1024 * 6));
+    static LinkedList<Integer> CACHE_INDEXES = new LinkedList<>();
+
+    static {
+        DBProperties.initProperties();
+        try {
+            initCacheAndIndex();
+        } catch (IOException e) {
+            throw new RuntimeException(e);
+        }
+    }
 
     public static void main(String[] args) throws Exception {
-        init();
         write("name", "henry");
         write("name", "list");
         write("age", "123");
@@ -67,54 +48,24 @@ public class DB {
     /**
      * 初始化索引
      */
-    public static void init() {
-        initPro();
-        try {
-            initCacheAndIndex();
-        } catch (IOException e) {
-            throw new RuntimeException(e);
-        }
-    }
-
-    private static void initPro() {
-        ResourceBundle rb2 = ResourceBundle.getBundle("db");
-        String dbDir = rb2.getString("db_dir");
-        BASE_PATH = dbDir + "//";
-        System.out.println(BASE_PATH);
-    }
-
-    /**
-     * 获取db文件名
-     */
-    public static String getBaseDataFileName() {
-        return BASE_PATH + "/" + DATA_DIR + "/" + DATA_FILE_NAME;
-    }
-
-    /**
-     * 获取磁盘缓存文件名
-     */
-    public static String getBaseCacheFileName() {
-        return BASE_PATH + "/" + CACHE_DIR + "/" + CACHE_FILE_NAME;
-    }
-
     private static void initCacheAndIndex() throws IOException {
-        Path cacheDir = Paths.get(BASE_PATH + "/" + CACHE_DIR);
+        Path cacheDir = Paths.get(DBProperties.getFullCacheDir());
         if (Files.exists(cacheDir)) {
             try (Stream<Path> list = Files.list(cacheDir)) {
                 for (Path path : list.collect(Collectors.toList())) {
-                    int index = Integer.parseInt(path.getFileName().toString().replace(CACHE_FILE_NAME, ""));
+                    int index = Integer.parseInt(path.getFileName().toString().replace(DBProperties.CACHE_FILE_NAME, ""));
                     String value = Files.readString(path);
                     CACHE_MAP.put(index, JSON.parseObject(value, new TypeReference<>() {
                     }));
                 }
             }
             if (!CACHE_MAP.isEmpty()) {
-                INDEXES.addAll(CACHE_MAP.keySet().stream().sorted().collect(Collectors.toList()));
+                CACHE_INDEXES.addAll(CACHE_MAP.keySet().stream().sorted().collect(Collectors.toList()));
             }
         }
 
-        if (INDEXES.isEmpty()) {
-            INDEXES.add(0);
+        if (CACHE_INDEXES.isEmpty()) {
+            CACHE_INDEXES.add(0);
         }
     }
 
@@ -122,15 +73,15 @@ public class DB {
         String bytes = key + ":" + value + ";";
         // 最新的段文件
         Path curPath = getCurDataPath();
-        int curIndex = INDEXES.getLast();
+        int curIndex = CACHE_INDEXES.getLast();
         if (Files.notExists(curPath)) {
             createFile(curPath);
         }
         boolean needTask = false;
-        if (curPath.toFile().length() > FILE_MAX_LENGTH) {
+        if (curPath.toFile().length() > DBProperties.DATA_FILE_MAX_LENGTH) {
             //文件过大，则使用新的段文件
             curIndex++;
-            INDEXES.addLast(curIndex);
+            CACHE_INDEXES.addLast(curIndex);
             curPath = getCurDataPath();
             Files.createFile(curPath);
             needTask = true;
@@ -148,8 +99,7 @@ public class DB {
 
         //保存到磁盘
         int finalCurIndex = curIndex;
-//        threadPoolExecutor.execute(() -> {
-        Path cachePath = Paths.get(getBaseCacheFileName() + finalCurIndex);
+        Path cachePath = Paths.get(DBProperties.getFullCacheFilePath(finalCurIndex));
         if (Files.notExists(cachePath)) {
             createFile(cachePath);
         }
@@ -158,12 +108,8 @@ public class DB {
         } catch (IOException e) {
             throw new RuntimeException(e);
         }
-//        });
 
         //合并与压缩
-//            threadPoolExecutor.execute(() -> {
-//                task();
-//            });
         if (needTask) {
             task();
         }
@@ -197,33 +143,31 @@ public class DB {
                 break;
             }
         }
-        CACHE_MAP.computeIfAbsent(INDEXES.getLast(), k -> new HashMap<>()).put(key, record);
+        CACHE_MAP.computeIfAbsent(CACHE_INDEXES.getLast(), k -> new HashMap<>()).put(key, record);
     }
 
-    // TODO: 2023/3/12 单线程实现
     private static void task() {
         try {
             //合并后文件
             int mergeIndex = 0;
             Path mergePath = null;
             FileChannel mergeChannel = null;
-            int lastIndex = INDEXES.get(INDEXES.size() - 2); //记录下合并的位置
+            int lastIndex = CACHE_INDEXES.get(CACHE_INDEXES.size() - 2); //记录下合并的位置
             Map<Integer, Map<String, Record>> mergeCacheMap = new TreeMap<>((o1, o2) -> o2 - o1); //合并后的cache
             long mergeOffset = 0; //合并后文件的偏移量
             //最新的不合并
-            for (int i = 0; i < INDEXES.size() - 1; i++) {
-                int index = INDEXES.get(i);
+            for (int i = 0; i < CACHE_INDEXES.size() - 1; i++) {
+                int index = CACHE_INDEXES.get(i);
                 Map<String, Record> recordMap = CACHE_MAP.get(index);
-                Path dataPath = Paths.get(getBaseDataFileName() + index);
+                Path dataPath = Paths.get(DBProperties.getFullDataFilePath(index));
                 if (recordMap == null || recordMap.isEmpty() || Files.notExists(dataPath)) {
                     continue;
                 }
-                // TODO: 2023/3/12 如何避免重复合并操作
                 try (FileChannel inChannel = FileChannel.open(dataPath, StandardOpenOption.READ)) {
                     for (Map.Entry<String, Record> entry : recordMap.entrySet()) {
                         if (mergePath == null) {
                             // 初始化临时文件
-                            mergePath = Paths.get(BASE_PATH + "/merge/" + mergeIndex);
+                            mergePath = Paths.get(DBProperties.getFullMergeFilePath(mergeIndex));
                             createFile(mergePath);
                             mergeChannel = FileChannel.open(mergePath, StandardOpenOption.WRITE);
                         }
@@ -244,11 +188,11 @@ public class DB {
                         //更新合并后的偏移量
                         mergeOffset += size;
 
-                        if (mergeChannel.size() > FILE_MAX_LENGTH) {
+                        if (mergeChannel.size() > DBProperties.DATA_FILE_MAX_LENGTH) {
                             mergeOffset = 0;
                             mergeChannel.close();
                             mergeIndex++;
-                            mergePath = Paths.get(BASE_PATH + "/merge/" + mergeIndex);
+                            mergePath = Paths.get(DBProperties.getFullMergeFilePath(mergeIndex));
                             createFile(mergePath);
                             mergeChannel = FileChannel.open(mergePath, StandardOpenOption.WRITE);
                         }
@@ -270,14 +214,14 @@ public class DB {
             }
 
             //清除并更新
-            Iterator<Integer> iterator = INDEXES.iterator();
+            Iterator<Integer> iterator = CACHE_INDEXES.iterator();
             while (iterator.hasNext()) {
                 Integer index = iterator.next();
-                Path dataPath = Paths.get(getBaseDataFileName() + index);
+                Path dataPath = Paths.get(DBProperties.getFullDataFilePath(index));
                 if (Files.exists(dataPath)) {
                     Files.delete(dataPath);
                 }
-                Path cachePath = Paths.get(getBaseCacheFileName() + index);
+                Path cachePath = Paths.get(DBProperties.getFullCacheFilePath(index));
                 if (Files.exists(cachePath)) {
                     Files.delete(cachePath);
                 }
@@ -288,18 +232,18 @@ public class DB {
                 }
             }
             for (int i = mergeIndex; i >= 0; i--) {
-                Path dstPath = Paths.get(getBaseDataFileName() + i);
-                Files.move(Paths.get(BASE_PATH + "/merge/" + i), dstPath);
+                Path dstPath = Paths.get(DBProperties.getFullDataFilePath(i));
+                Files.move(Paths.get(DBProperties.getFullMergeFilePath(i)), dstPath);
                 if (mergeCacheMap.containsKey(i)) {
                     CACHE_MAP.put(i, mergeCacheMap.get(i));
                 }
-                INDEXES.addFirst(i);
+                CACHE_INDEXES.addFirst(i);
             }
 
             mergeCacheMap.forEach((k, v) -> {
                 Path file = null;
                 try {
-                    file = Files.createFile(Paths.get(getBaseCacheFileName() + k));
+                    file = Files.createFile(Paths.get(DBProperties.getFullCacheFilePath(k)));
                 } catch (IOException e) {
                     throw new RuntimeException(e);
                 }
@@ -321,7 +265,7 @@ public class DB {
      * 获取最新数据文件
      */
     public static Path getCurDataPath() {
-        return Paths.get(getBaseDataFileName() + INDEXES.getLast());
+        return Paths.get(DBProperties.getFullDataFilePath(CACHE_INDEXES.getLast()));
     }
 
     public static String read(String key) throws IOException {
@@ -336,7 +280,7 @@ public class DB {
         if (record == null) {
             return null;
         }
-        File curFile = Paths.get(getBaseDataFileName() + index).toFile();
+        File curFile = Paths.get(DBProperties.getFullDataFilePath(index)).toFile();
         try (FileInputStream fileInputStream = new FileInputStream(curFile)) {
             long offset = record.getOffset();
             long size = record.getSize();
